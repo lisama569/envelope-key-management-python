@@ -71,3 +71,17 @@ class AuditVerificationError(EKMError):
 
     code = "EKM_AUDIT_VERIFICATION_FAILED"
     http_status = 500
+
+
+class KeyAlreadyExistsError(EKMError):
+    """密钥已存在（重复创建）。"""
+
+    code = "EKM_KEY_ALREADY_EXISTS"
+    http_status = 409
+
+
+class IdempotencyConflictError(EKMError):
+    """幂等键绑定了与当前不同的请求。"""
+
+    code = "EKM_IDEMPOTENCY_CONFLICT"
+    http_status = 409
