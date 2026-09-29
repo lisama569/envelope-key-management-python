@@ -43,3 +43,20 @@ class EnvelopeFormatError(KeyManagementError):
     """封装格式无法解析（版本、字段缺失或类型错误）。"""
 
     code: str = "envelope_format_error"
+
+
+class KeyVersionRetiredError(KeyManagementError):
+    """密钥版本已退役：存在但被显式标记为 RETIRED，拒绝一切解密。
+
+    与以下情形明确区分：
+    - KeyNotFoundError（密钥或版本根本不存在）；
+    - AuthorizationError / KeyScopeError（调用方越权）。
+    """
+
+    code: str = "key_version_retired"
+
+
+class RetirementBlockedError(KeyManagementError):
+    """退役被把关逻辑拒绝：仍有未迁完的历史密文或未成功的迁移项。"""
+
+    code: str = "retirement_blocked"
