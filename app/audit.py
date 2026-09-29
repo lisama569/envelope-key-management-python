@@ -23,9 +23,11 @@ class AuditLog:
     锁内完成序号分配与追加，保证并发下链式哈希仍自洽。
     """
 
-    def __init__(self) -> None:
+    def __init__(self, snapshot: dict | None = None) -> None:
         self._lock = threading.Lock()
         self._records: list[AuditRecord] = []
+        if snapshot:
+            self.restore(snapshot)
 
     def append(self, caller: str, action: str, key_id: str, detail: str) -> AuditRecord:
         with self._lock:
@@ -63,3 +65,23 @@ class AuditLog:
     def records(self) -> list[AuditRecord]:
         with self._lock:
             return list(self._records)
+
+    def snapshot(self) -> dict:
+        with self._lock:
+            return {"records": [
+                {
+                    "seq": r.seq,
+                    "timestamp": r.timestamp,
+                    "caller": r.caller,
+                    "action": r.action,
+                    "key_id": r.key_id,
+                    "detail": r.detail,
+                    "prev_hash": r.prev_hash,
+                    "record_hash": r.record_hash,
+                }
+                for r in self._records
+            ]}
+
+    def restore(self, snapshot: dict) -> None:
+        with self._lock:
+            self._records = [AuditRecord(**d) for d in snapshot.get("records", [])]

@@ -43,3 +43,25 @@ class EnvelopeFormatError(KeyManagementError):
     """封装格式无法解析（版本、字段缺失或类型错误）。"""
 
     code: str = "envelope_format_error"
+
+
+class KeyRetiredError(KeyManagementError):
+    """密钥版本已显式退役，不再允许用于解密。
+
+    与 KeyNotFoundError（版本根本不存在）和 AuthorizationError/KeyScopeError
+    （调用方越权）明确区分，调用方可以据此判断密文需要先重新迁移。
+    """
+
+    code: str = "key_retired"
+
+
+class RetirementBlockedError(KeyManagementError):
+    """版本尚不能退役：仍有未迁完的历史密文或上一次迁移有未成功的项。"""
+
+    code: str = "retirement_blocked"
+
+
+class MigrationBatchMismatchError(KeyManagementError):
+    """用同一批次号重试时提交的密文集合与首次提交不一致。"""
+
+    code: str = "migration_batch_mismatch"

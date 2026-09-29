@@ -10,6 +10,8 @@ from app.errors import AuthorizationError, KeyScopeError
 _OP_PERMISSION = {
     "create": "can_create",
     "rotate": "can_rotate",
+    "retire": "can_rotate",  # 退役与轮换同级，属于密钥生命周期管理
+    "migrate": None,  # 数据迁移只需在密钥授权范围内
     "encrypt": None,  # 仅需在密钥授权范围内
     "decrypt": None,
 }
