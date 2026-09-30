@@ -2,7 +2,8 @@
 
 在本地模拟一套密钥托管/归档/退役服务：主密钥按版本管理，支持创建、轮换、归档与退役；
 业务数据用信封加密（AES-256-GCM）保护，密文自携带定位密钥版本所需的元数据；
-历史密文可幂等批量迁移到当前活跃版本；迁移/退役/密钥状态可落盘，重启后从断点继续；
+历史密文可幂等批量迁移到当前活跃版本；密钥版本、迁移进度、退役状态、审计链与
+调用方授权可落盘，重启后从断点继续、授权关系不变；
 所有密钥状态变更写入可核验的审计链。
 
 ## 密钥版本模型
@@ -47,6 +48,12 @@ Envelope = { key_id, key_version, iv, ciphertext, tag, aad }
     不漏迁；
   - 每处理完一项立即原子落盘，进程被杀死/重启后用同一 `batch_id` 再交即可从断点继续。
 - 同一 `batch_id` 但密文集合与首次不一致 → `MigrationBatchMismatchError`（防串号、防漏项）。
+- **非法元素直接拒绝**：批次中混入不是合法信封的元素（类型不对、字段缺失、
+  字段类型错误、版本号非法、属于别的 `key_id`）时，在登记批次**之前**逐项校验并抛出
+  `EnvelopeFormatError`（`envelope_format_error`），错误信息给出元素下标与具体原因——
+  与越权（`authorization_error`/`key_scope_error`）、版本不存在（`key_not_found`）
+  明确区分，绝不把内部异常暴露给调用方；坏数据不会进入批次登记，
+  已迁好的进度不受影响，同一批次号改交干净数据可正常完成。
 - 报告逐项给出：批次内序号、指纹、来源版本、状态、目标版本、迁移后信封与失败原因；
   `complete=True` 当且仅当没有 `PENDING/FAILED` 项。
 
@@ -59,8 +66,11 @@ ARCHIVED，迁移结果仍然有效、可解密。已用活跃版本加密的项
 `retire_key(caller, key_id, version)` 把一个 `ARCHIVED` 版本显式标记为 `RETIRED`。
 
 - 退役需要与轮换同级的权限（`can_rotate`）；不能退役当前 `ACTIVE` 版本（先轮换再退役）。
-- **退役把关**：该版本在任一登记批次中仍有 `PENDING/FAILED` 的迁移项时，拒绝退役
-  （`RetirementBlockedError`），错误信息列出具体批次、项指纹与状态；全部迁完才放行。
+- **退役把关（整把密钥粒度）**：只要这把密钥还有任何没迁成功的历史数据——
+  任一登记批次中仍处于 `PENDING/FAILED` 的项，**不管它属于哪个版本**——
+  退役就必须被拦住（`RetirementBlockedError`）。错误信息逐条列出具体批次、
+  项指纹、来源版本与状态；判定在状态锁内完成，并发轮换、反复重试期间结果稳定。
+  等这些项全部迁成功后才放行。
 - 退役是幂等的：对已 `RETIRED` 的版本重复调用直接返回，不重复写审计。
 - 退役后再用该版本解密，抛出 **`KeyRetiredError`（`key_retired`）**——与
   "版本根本不存在"的 `KeyNotFoundError`（`key_not_found`）和"调用方越权"的
@@ -76,9 +86,13 @@ ARCHIVED，迁移结果仍然有效、可解密。已用活跃版本加密的项
   不产生解不开的密文，不出现无 `ACTIVE` 版本的窗口，退役状态与迁移进度始终对得上。
 - 逐项迁移"先解密重加密、再 CAS 落状态"：重复/并发提交已成功的项不会被二次迁移。
 - 设置 `KMS_STATE_FILE`（或构造 `JsonStateStore`）后，密钥版本、退役状态、
-  迁移批次进度与审计链写入**同一个 JSON 文件**，写入为"临时文件 + fsync + 原子替换"，
+  迁移批次进度、审计链与**调用方授权**写入**同一个 JSON 文件**，写入为"临时文件 + fsync + 原子替换"，
   任意时刻崩溃只会停留在上一份完整快照；重启后恢复，批次可从断点继续迁移，
   退役状态与审计哈希链仍可解释、可续验。
+- **重启后保留的状态**：密钥版本及其状态（ACTIVE/ARCHIVED/RETIRED）、迁移批次与逐项进度、
+  审计哈希链、以及调用方授权（调用方身份、可用密钥范围、`can_create`/`can_rotate` 权限）。
+  授权一经登记立即随其余状态落盘；重启不改变谁能做什么——已授权调用方照旧可用，
+  未授权调用方照旧被拒，无需重新登记。
 
 ## 完整性与篡改检测
 
@@ -104,7 +118,7 @@ ARCHIVED，迁移结果仍然有效、可解密。已用活跃版本加密的项
 | `MigrationBatchMismatchError` | `migration_batch_mismatch` | 同一 `batch_id` 重试时提交的密文集合与首次不一致 |
 | `NoActiveKeyError` | `no_active_key` | 密钥不存在或无 ACTIVE 版本时请求加密/迁移 |
 | `IntegrityError` | `integrity_error` | 密文/标签/元数据/AAD 被篡改，完整性校验失败（迁移时该项记为 FAILED） |
-| `EnvelopeFormatError` | `envelope_format_error` | 封装格式无法解析，或迁移批次为空 |
+| `EnvelopeFormatError` | `envelope_format_error` | 封装格式无法解析、迁移批次为空，或批次中混入非法元素（类型/结构不对、属于别的密钥） |
 | `KeyManagementConflictError` | `key_conflict` | 重复创建已存在的密钥 |
 
 HTTP 层状态码：授权类 403，`key_not_found` 为 404，冲突类
@@ -114,6 +128,7 @@ HTTP 层状态码：授权类 403，`key_not_found` 为 404，冲突类
 ## 授权与审计
 
 - 调用方（`Caller`）需预先注册，声明其可用的 `key_id` 集合及 `can_create`/`can_rotate` 权限；越权请求在执行任何状态变更前被拒绝。
+  授权关系随状态文件持久化：登记/变更立即落盘，重启后从快照恢复，重启不改变谁能做什么。
 - 每次密钥状态变更（`create_key`/`rotate_key`/`retire_key`/迁移登记/迁移完成）追加一条
   `AuditRecord`：包含序号、时间戳、调用方、动作、详情及**前一条记录的哈希**，形成哈希链。
   迁移完成记录含目标活跃版本与 migrated/already_current/skipped/failed/complete 计数。
@@ -136,8 +151,13 @@ HTTP 层状态码：授权类 403，`key_not_found` 为 404，冲突类
 uv sync
 
 # 运行全部测试（含轮换、篡改、越权、迁移幂等/重试、退役把关、
-# 迁移×轮换并发、重启断点续迁；日志打印密钥版本与判定依据）
+# 迁移×轮换并发、重启断点续迁、重启后授权保留、迁移非法元素拒绝；
+# 日志打印密钥版本与判定依据）
 uv run pytest -q -o log_cli=true -o log_cli_level=INFO
+
+# 只跑本次改动相关的三组用例
+uv run pytest tests/test_retirement_guard.py tests/test_restart_authz.py \
+    tests/test_migration_invalid_items.py -q -o log_cli=true -o log_cli_level=INFO
 
 # 启动 HTTP 服务（默认纯内存；设置 KMS_STATE_FILE 后状态落盘、重启可恢复）
 KMS_STATE_FILE=./kms-state.json uv run uvicorn main:app --reload

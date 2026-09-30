@@ -153,23 +153,22 @@ class MigrationStore:
 
     # ---- 退役把关所需的查询 ----
 
-    def outstanding_count(self, key_id: str, version: int) -> int:
-        """某密钥版本上尚未迁完（PENDING/FAILED）的密文项数量。"""
-        with self._lock:
-            n = 0
-            for batch in self._batches.values():
-                if batch.key_id != key_id:
-                    continue
-                for fp in batch.order:
-                    item = batch.items[fp]
-                    if item.source_version == version and item.status in (
-                        MigrationStatus.PENDING, MigrationStatus.FAILED,
-                    ):
-                        n += 1
-            return n
+    def outstanding_count(self, key_id: str, version: int | None = None) -> int:
+        """尚未迁完（PENDING/FAILED）的密文项数量。
 
-    def outstanding_summary(self, key_id: str, version: int) -> list[tuple[str, str, str]]:
-        """返回 (batch_id, fingerprint, status) 明细，用于说清退役被拦的原因。"""
+        version 为 None 时统计整把密钥（所有来源版本），否则只统计该版本名下。
+        """
+        return len(self.outstanding_summary(key_id, version))
+
+    def outstanding_summary(
+        self, key_id: str, version: int | None = None
+    ) -> list[tuple[str, str, str, int]]:
+        """返回 (batch_id, fingerprint, status, source_version) 明细。
+
+        退役把关以整把密钥为粒度（version=None）：只要这把密钥还有任何
+        没迁成功的历史数据——不管它属于哪个版本、哪个批次——都逐条列出，
+        用于说清退役被拦的原因。
+        """
         with self._lock:
             rows = []
             for batch in self._batches.values():
@@ -177,10 +176,13 @@ class MigrationStore:
                     continue
                 for fp in batch.order:
                     item = batch.items[fp]
-                    if item.source_version == version and item.status in (
+                    if version is not None and item.source_version != version:
+                        continue
+                    if item.status in (
                         MigrationStatus.PENDING, MigrationStatus.FAILED,
                     ):
-                        rows.append((batch.batch_id, fp, item.status.value))
+                        rows.append((batch.batch_id, fp, item.status.value,
+                                     item.source_version))
             return rows
 
     # ---- 快照 ----

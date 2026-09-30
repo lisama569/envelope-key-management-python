@@ -1,8 +1,10 @@
-"""按调用方区分的操作授权。"""
+"""按调用方区分的操作授权（可快照持久化，重启后授权关系保留）。"""
 
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass, field
+from typing import Callable, Optional
 
 from app.errors import AuthorizationError, KeyScopeError
 
@@ -28,17 +30,38 @@ class Caller:
 
 
 class Authorizer:
-    """注册调用方并校验其是否可对指定密钥执行指定操作。"""
+    """注册调用方并校验其是否可对指定密钥执行指定操作。
 
-    def __init__(self) -> None:
+    授权关系（调用方、可用密钥范围、操作权限）通过 snapshot()/restore()
+    与密钥版本、迁移进度、退役状态一起落盘，重启后原样恢复：
+    重启不改变谁能做什么。可选的变更监听在每次登记后触发持久化。
+    """
+
+    def __init__(self, snapshot: dict | None = None) -> None:
+        self._lock = threading.RLock()
         self._callers: dict[str, Caller] = {}
+        self._on_change: Optional[Callable[[], None]] = None
+        if snapshot:
+            self.restore(snapshot)
+
+    def set_change_listener(self, listener: Optional[Callable[[], None]]) -> None:
+        """登记/恢复之外的每次授权变更后回调（用于触发落盘）。"""
+        self._on_change = listener
 
     def register(self, caller: Caller) -> None:
-        self._callers[caller.name] = caller
+        with self._lock:
+            self._callers[caller.name] = caller
+        if self._on_change is not None:
+            self._on_change()
+
+    def get(self, name: str) -> Caller | None:
+        with self._lock:
+            return self._callers.get(name)
 
     def check(self, caller_name: str, key_id: str, operation: str) -> Caller:
         """校验通过返回 Caller；否则抛出 AuthorizationError/KeyScopeError。"""
-        caller = self._callers.get(caller_name)
+        with self._lock:
+            caller = self._callers.get(caller_name)
         if caller is None:
             raise AuthorizationError(f"unknown caller: {caller_name!r}")
         if operation not in _OP_PERMISSION:
@@ -53,3 +76,29 @@ class Authorizer:
                 f"caller {caller_name!r} lacks permission for operation {operation!r}"
             )
         return caller
+
+    # ---- 快照 ----
+
+    def snapshot(self) -> dict:
+        with self._lock:
+            return {"callers": [
+                {
+                    "name": c.name,
+                    "allowed_key_ids": sorted(c.allowed_key_ids),
+                    "can_rotate": c.can_rotate,
+                    "can_create": c.can_create,
+                }
+                for c in sorted(self._callers.values(), key=lambda c: c.name)
+            ]}
+
+    def restore(self, snapshot: dict) -> None:
+        with self._lock:
+            self._callers = {
+                d["name"]: Caller(
+                    name=d["name"],
+                    allowed_key_ids=frozenset(d.get("allowed_key_ids", [])),
+                    can_rotate=bool(d.get("can_rotate", False)),
+                    can_create=bool(d.get("can_create", False)),
+                )
+                for d in snapshot.get("callers", [])
+            }

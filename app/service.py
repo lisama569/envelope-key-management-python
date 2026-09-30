@@ -38,6 +38,35 @@ from app.persistence import JsonStateStore
 logger = logging.getLogger("kms")
 
 
+def _validate_envelope(env: object, index: int) -> Envelope:
+    """校验批次中的单个元素是结构完整的信封；否则抛 EnvelopeFormatError。
+
+    非法元素（类型不对、字段缺失、字段类型错误）必须在登记批次之前被
+    明确拒绝——给出能看懂、能与越权/版本不存在区分的原因，绝不把内部
+    异常（AttributeError/TypeError 等）暴露给调用方，也不让坏数据进入
+    批次登记污染迁移进度。
+    """
+    if not isinstance(env, Envelope):
+        raise EnvelopeFormatError(
+            f"envelope at index {index} is not an Envelope "
+            f"(got {type(env).__name__})"
+        )
+    problems: list[str] = []
+    if not isinstance(env.key_id, str) or not env.key_id:
+        problems.append("key_id must be a non-empty str")
+    if not isinstance(env.key_version, int) or isinstance(env.key_version, bool) \
+            or env.key_version < 1:
+        problems.append("key_version must be an int >= 1")
+    for name in ("iv", "ciphertext", "tag", "aad"):
+        if not isinstance(getattr(env, name), (bytes, bytearray)):
+            problems.append(f"{name} must be bytes")
+    if problems:
+        raise EnvelopeFormatError(
+            f"envelope at index {index} is malformed: {'; '.join(problems)}"
+        )
+    return env
+
+
 class KeyManagementService:
     """对外暴露 create/rotate/retire/encrypt/decrypt/migrate，状态变更均审计并持久化。"""
 
@@ -61,12 +90,16 @@ class KeyManagementService:
             self._keystore = keystore or LocalKeyStore(restored.get("keystore"))
             self._audit = audit or AuditLog(restored.get("audit"))
             self._migration = migration_store or MigrationStore(restored.get("migrations"))
+            # 调用方授权同样从快照恢复：重启不改变谁能做什么
+            self._authorizer = authorizer or Authorizer(restored.get("authz"))
         else:
             self._keystore = keystore or LocalKeyStore()
             self._audit = audit or AuditLog()
             self._migration = migration_store or MigrationStore()
+            self._authorizer = authorizer or Authorizer()
         self._cipher = cipher or EnvelopeCipher()
-        self._authorizer = authorizer or Authorizer()
+        # 授权关系一经登记/变更立即随其余状态一起落盘
+        self._authorizer.set_change_listener(self._persist)
 
     @property
     def audit(self) -> AuditLog:
@@ -85,13 +118,15 @@ class KeyManagementService:
         return self._migration
 
     def _persist(self) -> None:
-        """在状态锁内调用：把三部分状态原子落盘。"""
+        """把四部分状态（含调用方授权）原子落盘；可在状态锁内或授权变更回调中调用。"""
         if self._state_store is not None:
-            self._state_store.save(
-                self._keystore.snapshot(),
-                self._migration.snapshot(),
-                self._audit.snapshot(),
-            )
+            with self._state_lock:
+                self._state_store.save(
+                    self._keystore.snapshot(),
+                    self._migration.snapshot(),
+                    self._audit.snapshot(),
+                    self._authorizer.snapshot(),
+                )
 
     # ---- 生命周期管理 ----
 
@@ -127,7 +162,10 @@ class KeyManagementService:
     def retire_key(self, caller: str, key_id: str, version: int) -> int:
         """显式退役一个非 ACTIVE 版本；退役后该版本解密被 KeyRetiredError 拒绝。
 
-        把关：该版本仍有 PENDING/FAILED 的迁移项时拒绝退役。
+        把关（整把密钥粒度）：只要这把密钥还有任何没迁成功的历史数据
+        （任一登记批次中仍处于 PENDING/FAILED 的项，不管它属于哪个版本），
+        退役就必须被拦住；判定在状态锁内完成，并发轮换/反复重试下结果稳定。
+        等这些项全部迁成功后才放行。
         对已经是 RETIRED 的版本重复调用是幂等的，直接返回该版本号。
         """
         self._authorizer.check(caller, key_id, "retire")
@@ -147,19 +185,21 @@ class KeyManagementService:
                     f"cannot retire the active version: {key_id} v{version}; "
                     f"rotate to a newer version first"
                 )
-            outstanding = self._migration.outstanding_summary(key_id, version)
+            # 整把密钥粒度：任何版本名下的未成功项都拦住退役
+            outstanding = self._migration.outstanding_summary(key_id)
             if outstanding:
                 detail = ", ".join(
-                    f"batch={bid} item={fp[:12]} status={st}" for bid, fp, st in outstanding
+                    f"batch={bid} item={fp[:12]} source_version=v{sv} status={st}"
+                    for bid, fp, st, sv in outstanding
                 )
                 logger.info(
-                    "retire_key 拒绝: caller=%s key=%s v%d 原因=尚有 %d 项未迁完 (%s)",
+                    "retire_key 拒绝: caller=%s key=%s v%d 原因=密钥名下尚有 %d 项未迁完 (%s)",
                     caller, key_id, version, len(outstanding), detail,
                 )
                 raise RetirementBlockedError(
                     f"version {version} of {key_id!r} cannot be retired: "
-                    f"{len(outstanding)} ciphertext item(s) are not migrated yet "
-                    f"(pending/failed); detail=[{detail}]"
+                    f"{len(outstanding)} ciphertext item(s) of this key are not "
+                    f"migrated yet (pending/failed); detail=[{detail}]"
                 )
             retired = self._keystore.retire(key_id, version)
             self._audit.append(caller, "retire_key", key_id,
@@ -167,7 +207,8 @@ class KeyManagementService:
                                f"outstanding_at_retirement=0")
             self._persist()
         logger.info(
-            "retire_key 完成: caller=%s key=%s v%d 判定依据=无未迁完项, 此后该版本解密将拒绝",
+            "retire_key 完成: caller=%s key=%s v%d 判定依据=整把密钥无未迁完项, "
+            "此后该版本解密将拒绝",
             caller, key_id, version,
         )
         return retired.version
@@ -229,9 +270,17 @@ class KeyManagementService:
         self._authorizer.check(caller, key_id, "migrate")
         if not envelopes:
             raise EnvelopeFormatError("migration batch is empty")
+        # 先逐项校验再登记：非法元素直接拒绝，不进入批次、不影响既有进度
+        checked = [_validate_envelope(env, idx) for idx, env in enumerate(envelopes)]
+        for idx, env in enumerate(checked):
+            if env.key_id != key_id:
+                raise EnvelopeFormatError(
+                    f"envelope at index {idx} belongs to key "
+                    f"{env.key_id!r}, not {key_id!r}"
+                )
 
         with self._state_lock:
-            batch, created = self._migration.register_or_get(batch_id, key_id, envelopes)
+            batch, created = self._migration.register_or_get(batch_id, key_id, checked)
             if created:
                 self._audit.append(
                     caller, "migration_register", key_id,

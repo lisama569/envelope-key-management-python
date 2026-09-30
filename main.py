@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import binascii
 import os
 
 from fastapi import FastAPI, Header
@@ -10,7 +11,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from app.authz import Caller
-from app.errors import KeyManagementError
+from app.errors import EnvelopeFormatError, KeyManagementError
 from app.models import Envelope
 from app.persistence import JsonStateStore
 from app.service import KeyManagementService
@@ -22,12 +23,16 @@ _state_file = os.environ.get("KMS_STATE_FILE")
 service = KeyManagementService(
     state_store=JsonStateStore(_state_file) if _state_file else None
 )
-# 演示用调用方：admin 可创建/轮换，app-orders 仅可对 orders 加解密
-service.authorizer.register(Caller(
-    name="admin", allowed_key_ids=frozenset({"orders"}),
-    can_rotate=True, can_create=True,
-))
-service.authorizer.register(Caller(name="app-orders", allowed_key_ids=frozenset({"orders"})))
+# 演示用调用方：admin 可创建/轮换，app-orders 仅可对 orders 加解密。
+# 已持久化的授权关系在重启后从状态文件恢复，这里只补齐缺失的默认调用方，
+# 不覆盖已有配置（重启不改变谁能做什么）。
+if service.authorizer.get("admin") is None:
+    service.authorizer.register(Caller(
+        name="admin", allowed_key_ids=frozenset({"orders"}),
+        can_rotate=True, can_create=True,
+    ))
+if service.authorizer.get("app-orders") is None:
+    service.authorizer.register(Caller(name="app-orders", allowed_key_ids=frozenset({"orders"})))
 
 
 def _b64e(b: bytes) -> str:
@@ -97,14 +102,19 @@ class MigrateRequest(BaseModel):
 
 
 def _envelope_from_req(req: DecryptRequest) -> Envelope:
-    return Envelope(
-        key_id=req.key_id,
-        key_version=req.key_version,
-        iv=_b64d(req.iv_b64),
-        ciphertext=_b64d(req.ciphertext_b64),
-        tag=_b64d(req.tag_b64),
-        aad=_b64d(req.aad_b64),
-    )
+    """把请求体转成信封；base64 等解析失败统一转为 EnvelopeFormatError（400），
+    不把内部解析异常暴露为 500。"""
+    try:
+        return Envelope(
+            key_id=req.key_id,
+            key_version=req.key_version,
+            iv=_b64d(req.iv_b64),
+            ciphertext=_b64d(req.ciphertext_b64),
+            tag=_b64d(req.tag_b64),
+            aad=_b64d(req.aad_b64),
+        )
+    except (ValueError, binascii.Error) as exc:
+        raise EnvelopeFormatError(f"malformed envelope encoding: {exc}") from exc
 
 
 def _envelope_to_json(env: Envelope) -> dict:
@@ -164,14 +174,7 @@ def encrypt(req: EncryptRequest, x_caller: str = Header()) -> dict:
 
 @app.post("/decrypt")
 def decrypt(req: DecryptRequest, x_caller: str = Header()) -> dict:
-    env = Envelope(
-        key_id=req.key_id,
-        key_version=req.key_version,
-        iv=_b64d(req.iv_b64),
-        ciphertext=_b64d(req.ciphertext_b64),
-        tag=_b64d(req.tag_b64),
-        aad=_b64d(req.aad_b64),
-    )
+    env = _envelope_from_req(req)
     return {"plaintext_b64": _b64e(service.decrypt(x_caller, env))}
 
 
