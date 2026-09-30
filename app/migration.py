@@ -17,7 +17,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Optional
 
-from app.errors import MigrationBatchMismatchError
+from app.errors import EnvelopeFormatError, MigrationBatchMismatchError
 from app.models import Envelope, MigrationStatus
 
 
@@ -54,6 +54,45 @@ def envelope_fingerprint(env: Envelope) -> str:
         h.update(len(part).to_bytes(4, "big"))
         h.update(part)
     return h.hexdigest()
+
+
+def validate_envelope_for_migration(env: object, index: int, key_id: str) -> Envelope:
+    """严格校验迁移批次中的单个元素是否为可处理的合法信封。
+
+    类型不对、字段缺失/类型不对、结构不完整或与批次目标密钥不一致时，
+    一律抛 EnvelopeFormatError（code=envelope_format_error），
+    与越权（authorization_error/key_scope_error）、版本不存在（key_not_found）
+    明确区分；绝不把 AttributeError/ValueError 等内部异常冒给调用方。
+    """
+    if not isinstance(env, Envelope):
+        raise EnvelopeFormatError(
+            f"migration batch item {index} is not a valid envelope: "
+            f"expected Envelope, got {type(env).__name__}"
+        )
+    problems: list[str] = []
+    if not isinstance(env.key_id, str) or not env.key_id:
+        problems.append("key_id must be a non-empty string")
+    elif env.key_id != key_id:
+        problems.append(
+            f"key_id mismatch: item belongs to {env.key_id!r}, "
+            f"but batch targets {key_id!r}"
+        )
+    if not isinstance(env.key_version, int) or isinstance(env.key_version, bool) \
+            or env.key_version < 1:
+        problems.append("key_version must be a positive integer")
+    for name, value, expected_len in (("iv", env.iv, 12), ("tag", env.tag, 16)):
+        if not isinstance(value, bytes) or len(value) != expected_len:
+            problems.append(f"{name} must be exactly {expected_len} raw bytes")
+    for name in ("ciphertext", "aad"):
+        value = getattr(env, name)
+        if not isinstance(value, bytes):
+            problems.append(f"{name} must be raw bytes")
+    if problems:
+        raise EnvelopeFormatError(
+            f"migration batch item {index} is not a valid envelope: "
+            + "; ".join(problems)
+        )
+    return env
 
 
 @dataclass
@@ -151,10 +190,14 @@ class MigrationStore:
             item.status = MigrationStatus.FAILED
             item.error = error
 
-    # ---- 退役把关所需的查询 ----
+    # ---- 退役把关所需的查询（整把密钥维度） ----
 
-    def outstanding_count(self, key_id: str, version: int) -> int:
-        """某密钥版本上尚未迁完（PENDING/FAILED）的密文项数量。"""
+    def outstanding_count(self, key_id: str) -> int:
+        """这把密钥（任一版本）上尚未迁成功（PENDING/FAILED）的密文项数量。
+
+        退役把关按"密钥"而不是"被退役版本"判定：只要同一 key_id 的任何一个
+        登记批次中还有历史数据没迁成功，该密钥的任何归档版本都不能退役。
+        """
         with self._lock:
             n = 0
             for batch in self._batches.values():
@@ -162,14 +205,16 @@ class MigrationStore:
                     continue
                 for fp in batch.order:
                     item = batch.items[fp]
-                    if item.source_version == version and item.status in (
-                        MigrationStatus.PENDING, MigrationStatus.FAILED,
-                    ):
+                    if item.status in (MigrationStatus.PENDING, MigrationStatus.FAILED):
                         n += 1
             return n
 
-    def outstanding_summary(self, key_id: str, version: int) -> list[tuple[str, str, str]]:
-        """返回 (batch_id, fingerprint, status) 明细，用于说清退役被拦的原因。"""
+    def outstanding_summary(self, key_id: str) -> list[tuple[str, str, int, str]]:
+        """返回 (batch_id, fingerprint, source_version, status) 明细。
+
+        覆盖这把密钥所有版本、所有登记批次中的未成功项，用于在拒绝退役时
+        说清是哪个批次、哪一项、卡在什么状态（以及它来自哪个版本）。
+        """
         with self._lock:
             rows = []
             for batch in self._batches.values():
@@ -177,10 +222,9 @@ class MigrationStore:
                     continue
                 for fp in batch.order:
                     item = batch.items[fp]
-                    if item.source_version == version and item.status in (
-                        MigrationStatus.PENDING, MigrationStatus.FAILED,
-                    ):
-                        rows.append((batch.batch_id, fp, item.status.value))
+                    if item.status in (MigrationStatus.PENDING, MigrationStatus.FAILED):
+                        rows.append((batch.batch_id, fp, item.source_version,
+                                     item.status.value))
             return rows
 
     # ---- 快照 ----

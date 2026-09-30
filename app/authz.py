@@ -28,12 +28,18 @@ class Caller:
 
 
 class Authorizer:
-    """注册调用方并校验其是否可对指定密钥执行指定操作。"""
+    """注册调用方并校验其是否可对指定密钥执行指定操作。
 
-    def __init__(self) -> None:
+    调用方授权与密钥版本/迁移进度一样可快照持久化：重启后谁能做什么不变。
+    """
+
+    def __init__(self, snapshot: dict | None = None) -> None:
         self._callers: dict[str, Caller] = {}
+        if snapshot:
+            self.restore(snapshot)
 
     def register(self, caller: Caller) -> None:
+        # 重复注册以最新声明为准（重启引导时幂等覆盖同样安全）
         self._callers[caller.name] = caller
 
     def check(self, caller_name: str, key_id: str, operation: str) -> Caller:
@@ -53,3 +59,27 @@ class Authorizer:
                 f"caller {caller_name!r} lacks permission for operation {operation!r}"
             )
         return caller
+
+    # ---- 快照：调用方授权随密钥/迁移/审计一起落盘，重启后授权关系不变 ----
+
+    def snapshot(self) -> dict:
+        return {"callers": [
+            {
+                "name": c.name,
+                "allowed_key_ids": sorted(c.allowed_key_ids),
+                "can_rotate": c.can_rotate,
+                "can_create": c.can_create,
+            }
+            for c in self._callers.values()
+        ]}
+
+    def restore(self, snapshot: dict) -> None:
+        """从 snapshot() 产生的结构恢复；仅在构造期调用。"""
+        self._callers = {}
+        for d in snapshot.get("callers", []):
+            self._callers[d["name"]] = Caller(
+                name=d["name"],
+                allowed_key_ids=frozenset(d.get("allowed_key_ids", ())),
+                can_rotate=bool(d.get("can_rotate", False)),
+                can_create=bool(d.get("can_create", False)),
+            )

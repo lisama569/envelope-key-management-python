@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import binascii
 import os
 
 from fastapi import FastAPI, Header
@@ -10,7 +11,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from app.authz import Caller
-from app.errors import KeyManagementError
+from app.errors import EnvelopeFormatError, KeyManagementError
 from app.models import Envelope
 from app.persistence import JsonStateStore
 from app.service import KeyManagementService
@@ -22,12 +23,14 @@ _state_file = os.environ.get("KMS_STATE_FILE")
 service = KeyManagementService(
     state_store=JsonStateStore(_state_file) if _state_file else None
 )
-# 演示用调用方：admin 可创建/轮换，app-orders 仅可对 orders 加解密
-service.authorizer.register(Caller(
+# 演示用调用方：admin 可创建/轮换，app-orders 仅可对 orders 加解密。
+# 用 register_caller 登记：设置了 KMS_STATE_FILE 时授权关系会落盘，
+# 快照里已存在同名调用方时直接幂等覆盖，重启后无需重新登记。
+service.register_caller(Caller(
     name="admin", allowed_key_ids=frozenset({"orders"}),
     can_rotate=True, can_create=True,
 ))
-service.authorizer.register(Caller(name="app-orders", allowed_key_ids=frozenset({"orders"})))
+service.register_caller(Caller(name="app-orders", allowed_key_ids=frozenset({"orders"})))
 
 
 def _b64e(b: bytes) -> str:
@@ -35,7 +38,11 @@ def _b64e(b: bytes) -> str:
 
 
 def _b64d(s: str) -> bytes:
-    return base64.b64decode(s.encode())
+    try:
+        return base64.b64decode(s.encode(), validate=True)
+    except (binascii.Error, ValueError) as exc:
+        # 非法 base64 属于调用方输入格式问题，不能以 500 内部错误暴露
+        raise EnvelopeFormatError(f"invalid base64 field: {exc}") from exc
 
 
 class CreateKeyRequest(BaseModel):

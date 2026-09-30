@@ -14,7 +14,7 @@ import logging
 import threading
 
 from app.audit import AuditLog
-from app.authz import Authorizer
+from app.authz import Authorizer, Caller
 from app.crypto import EnvelopeCipher
 from app.errors import (
     EnvelopeFormatError,
@@ -25,7 +25,7 @@ from app.errors import (
     RetirementBlockedError,
 )
 from app.keystore import LocalKeyStore
-from app.migration import MigrationStore
+from app.migration import MigrationStore, validate_envelope_for_migration
 from app.models import (
     Envelope,
     KeyStatus,
@@ -61,12 +61,14 @@ class KeyManagementService:
             self._keystore = keystore or LocalKeyStore(restored.get("keystore"))
             self._audit = audit or AuditLog(restored.get("audit"))
             self._migration = migration_store or MigrationStore(restored.get("migrations"))
+            # 调用方授权与密钥/迁移状态同文件落盘：重启后谁能做什么不变
+            self._authorizer = authorizer or Authorizer(restored.get("authz"))
         else:
             self._keystore = keystore or LocalKeyStore()
             self._audit = audit or AuditLog()
             self._migration = migration_store or MigrationStore()
+            self._authorizer = authorizer or Authorizer()
         self._cipher = cipher or EnvelopeCipher()
-        self._authorizer = authorizer or Authorizer()
 
     @property
     def audit(self) -> AuditLog:
@@ -85,13 +87,28 @@ class KeyManagementService:
         return self._migration
 
     def _persist(self) -> None:
-        """在状态锁内调用：把三部分状态原子落盘。"""
+        """在状态锁内调用：把四部分状态原子落盘。"""
         if self._state_store is not None:
             self._state_store.save(
                 self._keystore.snapshot(),
                 self._migration.snapshot(),
                 self._audit.snapshot(),
+                self._authorizer.snapshot(),
             )
+
+    def register_caller(self, caller: Caller) -> None:
+        """登记（或更新）调用方授权，并随状态快照一起持久化。
+
+        持久化模式下重启无需重新登记：可用密钥范围与操作权限原样恢复。
+        """
+        with self._state_lock:
+            self._authorizer.register(caller)
+            self._persist()
+        logger.info(
+            "register_caller caller=%s keys=%s can_create=%s can_rotate=%s",
+            caller.name, sorted(caller.allowed_key_ids),
+            caller.can_create, caller.can_rotate,
+        )
 
     # ---- 生命周期管理 ----
 
@@ -147,27 +164,33 @@ class KeyManagementService:
                     f"cannot retire the active version: {key_id} v{version}; "
                     f"rotate to a newer version first"
                 )
-            outstanding = self._migration.outstanding_summary(key_id, version)
+            # 把关按整把密钥判定：只要该 key_id 还有任一历史数据项（无论来自哪个
+            # 版本、属于哪个批次）没迁成功，任何归档版本都不能退役。
+            outstanding = self._migration.outstanding_summary(key_id)
             if outstanding:
                 detail = ", ".join(
-                    f"batch={bid} item={fp[:12]} status={st}" for bid, fp, st in outstanding
+                    f"batch={bid} item={fp[:12]} source_version={sv} status={st}"
+                    for bid, fp, sv, st in outstanding
                 )
                 logger.info(
-                    "retire_key 拒绝: caller=%s key=%s v%d 原因=尚有 %d 项未迁完 (%s)",
+                    "retire_key 拒绝: caller=%s key=%s v%d 原因=该密钥尚有 %d 项未迁成功 "
+                    "(跨全部版本/批次) (%s)",
                     caller, key_id, version, len(outstanding), detail,
                 )
                 raise RetirementBlockedError(
-                    f"version {version} of {key_id!r} cannot be retired: "
-                    f"{len(outstanding)} ciphertext item(s) are not migrated yet "
-                    f"(pending/failed); detail=[{detail}]"
+                    f"version {version} of key {key_id!r} cannot be retired: "
+                    f"{len(outstanding)} ciphertext item(s) on this key (across any "
+                    f"version/batch) are not migrated successfully yet (pending/failed); "
+                    f"detail=[{detail}]"
                 )
             retired = self._keystore.retire(key_id, version)
             self._audit.append(caller, "retire_key", key_id,
                                f"version={retired.version} status=retired "
-                               f"outstanding_at_retirement=0")
+                               f"outstanding_on_key_at_retirement=0")
             self._persist()
         logger.info(
-            "retire_key 完成: caller=%s key=%s v%d 判定依据=无未迁完项, 此后该版本解密将拒绝",
+            "retire_key 完成: caller=%s key=%s v%d 判定依据=该密钥全部版本无未成功迁移项, "
+            "此后该版本解密将拒绝",
             caller, key_id, version,
         )
         return retired.version
@@ -229,6 +252,12 @@ class KeyManagementService:
         self._authorizer.check(caller, key_id, "migrate")
         if not envelopes:
             raise EnvelopeFormatError("migration batch is empty")
+
+        # 先整批做结构校验，再进入锁登记批次：任何一个元素不是合法信封
+        # （类型不对/结构不完整/key_id 对不上）都以可区分的 envelope_format_error
+        # 整体拒绝，不登记批次、不产生任何状态变更，更不会冒出内部异常。
+        for idx, raw in enumerate(envelopes):
+            validate_envelope_for_migration(raw, idx, key_id)
 
         with self._state_lock:
             batch, created = self._migration.register_or_get(batch_id, key_id, envelopes)
